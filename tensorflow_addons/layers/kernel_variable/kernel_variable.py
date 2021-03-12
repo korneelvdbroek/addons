@@ -16,13 +16,15 @@
 """Contains KernelVariable, a variable which allows to manipulate a kernel on assign() and on read_value()."""
 
 import tensorflow as tf
+from tensorflow.python.distribute import ps_values as ps_distribute_values
+from tensorflow.python.distribute import values as distribute_values
 
 
 class KernelVariable(tf.Variable):
   """Variable that will cast itself to a different dtype in applicable contexts.
   """
 
-  def __init__(self, variable):
+  def __init__(self, variable, alter_kernel, upon_kernel_assign):
     """Creates an KernelVariable instance.
 
     Args:
@@ -44,23 +46,26 @@ class KernelVariable(tf.Variable):
     # op attribute in AutoCastVariable.assign().
     self._op = 'delegate'
 
+    self.alter_kernel = alter_kernel
+    self.upon_kernel_assign = upon_kernel_assign
+
   @property
   def dtype(self):
     """The dtype of the underlying variable, before any casts are done."""
     return self._variable.dtype
 
   def value(self):
-    return self._variable.value()
+    return self.alter_kernel(self._variable.value())
 
   def read_value(self):
-    return self._variable.read_value()
+    return self.alter_kernel(self._variable.read_value())
 
   def __getattr__(self, name):
     return getattr(self._variable, name)
 
   def _dense_var_to_tensor(self, dtype=None, name=None, as_ref=False):
     """Converts this variable to a tensor."""
-    return tf.convert_to_tensor(self._variable, dtype, name, as_ref)
+    return self.alter_kernel(tf.convert_to_tensor(self._variable, dtype, name, as_ref))
 
   def _should_act_as_resource_variable(self):
     """Pass resource_variable_ops.is_resource_variable check."""
@@ -69,12 +74,12 @@ class KernelVariable(tf.Variable):
   def __repr__(self):
     if tf.executing_eagerly() and not self._in_graph_mode:
       repr_str = ("<KernelVariable '{v.name}' shape={v.shape} "
-                  'dtype={v.dtype.name} dtype_to_cast_to={v._cast_dtype.name}, '
+                  'dtype={v.dtype.name}, '
                   'numpy={np_repr}>')
       return repr_str.format(v=self, np_repr=self.read_value())
     else:
       repr_str = ("<KernelVariable '{v.name}' shape={v.shape} "
-                  'dtype={v.dtype.name} dtype_to_cast_to={v._cast_dtype.name}>')
+                  'dtype={v.dtype.name}>')
       return repr_str.format(v=self)
 
   # Method delegations: We delegate the following methods to self._variable.
@@ -129,34 +134,27 @@ class KernelVariable(tf.Variable):
     # TODO(b/146181571): This logic can be simplified once
     # DistributedVariable.assign returns a DistributedVariable. Currently for
     # MirroredStrategy, it returns a Mirrored value.
-    if ops.executing_eagerly_outside_functions():
+    if tf.compat.v1.executing_eagerly_outside_functions():
       assign_op = update_fn(value, use_locking, name, False)
       if read_value:
         # We create a new AutoCastVariable with the same underlying tf.Variable.
         # The new AutoCastVariable is identical except the 'op' attribute is
         # defined. This matches the behavior of tf.Variable.assign.
-        var = create_autocast_variable(self._variable)
+        var = create_kernel_variable(self._variable, self.alter_kernel, self.upon_kernel_assign)
         var._op = assign_op  # pylint:disable=protected-access
         return var
       return assign_op
 
     # Fallback to wrapping the returned variable in graph mode if possible
     assign_var = update_fn(value, use_locking, name, read_value)
-    if read_value and resource_variable_ops.is_resource_variable(assign_var):
-      return create_autocast_variable(assign_var)
+    if read_value:
+      return create_kernel_variable(assign_var, self.alter_kernel, self.upon_kernel_assign)
     return assign_var
 
   def assign(self, value, use_locking=None, name=None, read_value=True):
-    return self._apply_assign_update(self._variable.assign, value, use_locking,
+    altered_value = self.alter_kernel(value)
+    return self._apply_assign_update(self._variable.assign, altered_value, use_locking,
                                      name, read_value)
-
-  def assign_add(self, delta, use_locking=None, name=None, read_value=True):
-    return self._apply_assign_update(self._variable.assign_add, delta,
-                                     use_locking, name, read_value)
-
-  def assign_sub(self, delta, use_locking=None, name=None, read_value=True):
-    return self._apply_assign_update(self._variable.assign_sub, delta,
-                                     use_locking, name, read_value)
 
   def load(self, value, session=None):
     return self._variable.load(value, session)
@@ -342,3 +340,46 @@ class KernelVariable(tf.Variable):
     except AttributeError:
       # See https://docs.python.org/3/library/constants.html#NotImplemented
       return NotImplemented
+
+
+def create_kernel_variable(variable, alter_kernel, upon_kernel_assign):
+  """Creates an KernelVariable that wraps another variable.
+
+  This typically just returns `AutoCastVariable(variable)`. But, if the variable
+  is a DistributedVariable or one of its subclasses, we instead dynamically
+  create a class that subclasses from both AutoCastVariable and
+  variable.__class__. This is so the returned variable will still pass
+  `isinstance(variable, variable.__class__)`, which is required for
+  DistributedVariables and its subclasses to work properly.
+
+  Args:
+    variable: A floating-point resource variable to wrap.
+
+  Returns:
+    An AutoCastVariable that wraps the variable.
+  """
+  if not isinstance(variable, (distribute_values.DistributedVariable,
+                               ps_distribute_values.AggregatingVariable)):
+    return KernelVariable(variable, alter_kernel, upon_kernel_assign)
+
+  class KernelDistributedVariable(KernelVariable, variable.__class__):
+    """An KernelVariable that also subclasses from variable.__class__.
+
+    variable.__class__ is either a DistributedVariable or an
+    AggregatingVariable.
+    """
+
+    def __repr__(self):
+      if issubclass(ps_distribute_values.AggregatingVariable,
+                    variable.__class__):
+        # AggregatingVariable's __repr__ simply calls super.__repr__. So we do
+        # the same here for consistency, which calls AutoCastVariable.__repr__.
+        return super(KernelDistributedVariable, self).__repr__()
+
+      # pylint: disable=missing-format-attribute
+      return ('<KernelDistributedVariable dtype={v.dtype.name} '
+              'inner_variable={v._variable}>'
+             ).format(v=self)
+      # pylint: enable=missing-format-attribute
+
+  return KernelDistributedVariable(variable, alter_kernel, upon_kernel_assign)
