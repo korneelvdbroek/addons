@@ -140,7 +140,7 @@ class KernelVariable(tf.Variable):
         # We create a new AutoCastVariable with the same underlying tf.Variable.
         # The new AutoCastVariable is identical except the 'op' attribute is
         # defined. This matches the behavior of tf.Variable.assign.
-        var = create_kernel_variable(self._variable, self.alter_kernel, self.upon_kernel_assign)
+        var = CreateKernelVariable(self.alter_kernel, self.upon_kernel_assign)(self._variable)
         var._op = assign_op  # pylint:disable=protected-access
         return var
       return assign_op
@@ -148,12 +148,13 @@ class KernelVariable(tf.Variable):
     # Fallback to wrapping the returned variable in graph mode if possible
     assign_var = update_fn(value, use_locking, name, read_value)
     if read_value:
-      return create_kernel_variable(assign_var, self.alter_kernel, self.upon_kernel_assign)
+      return CreateKernelVariable(self.alter_kernel, self.upon_kernel_assign)(self._variable)
     return assign_var
 
   def assign(self, value, use_locking=None, name=None, read_value=True):
-    altered_value = self.alter_kernel(value)
-    return self._apply_assign_update(self._variable.assign, altered_value, use_locking,
+    # hook for calculation
+    self.upon_kernel_assign(value)
+    return self._apply_assign_update(self._variable.assign, value, use_locking,
                                      name, read_value)
 
   def load(self, value, session=None):
@@ -342,7 +343,7 @@ class KernelVariable(tf.Variable):
       return NotImplemented
 
 
-def create_kernel_variable(variable, alter_kernel, upon_kernel_assign):
+class CreateKernelVariable(object):
   """Creates an KernelVariable that wraps another variable.
 
   This typically just returns `AutoCastVariable(variable)`. But, if the variable
@@ -358,28 +359,33 @@ def create_kernel_variable(variable, alter_kernel, upon_kernel_assign):
   Returns:
     An AutoCastVariable that wraps the variable.
   """
-  if not isinstance(variable, (distribute_values.DistributedVariable,
-                               ps_distribute_values.AggregatingVariable)):
-    return KernelVariable(variable, alter_kernel, upon_kernel_assign)
+  def __init__(self, alter_kernel, upon_kernel_assign):
+    self.alter_kernel = alter_kernel
+    self.upon_kernel_assign = upon_kernel_assign
 
-  class KernelDistributedVariable(KernelVariable, variable.__class__):
-    """An KernelVariable that also subclasses from variable.__class__.
+  def __call__(self, variable):
+    if not isinstance(variable, (distribute_values.DistributedVariable,
+                                 ps_distribute_values.AggregatingVariable)):
+      return KernelVariable(variable, self.alter_kernel, self.upon_kernel_assign)
 
-    variable.__class__ is either a DistributedVariable or an
-    AggregatingVariable.
-    """
+    class KernelDistributedVariable(KernelVariable, variable.__class__):
+      """An KernelVariable that also subclasses from variable.__class__.
 
-    def __repr__(self):
-      if issubclass(ps_distribute_values.AggregatingVariable,
-                    variable.__class__):
-        # AggregatingVariable's __repr__ simply calls super.__repr__. So we do
-        # the same here for consistency, which calls AutoCastVariable.__repr__.
-        return super(KernelDistributedVariable, self).__repr__()
+      variable.__class__ is either a DistributedVariable or an
+      AggregatingVariable.
+      """
 
-      # pylint: disable=missing-format-attribute
-      return ('<KernelDistributedVariable dtype={v.dtype.name} '
-              'inner_variable={v._variable}>'
-             ).format(v=self)
-      # pylint: enable=missing-format-attribute
+      def __repr__(self):
+        if issubclass(ps_distribute_values.AggregatingVariable,
+                      variable.__class__):
+          # AggregatingVariable's __repr__ simply calls super.__repr__. So we do
+          # the same here for consistency, which calls AutoCastVariable.__repr__.
+          return super(KernelDistributedVariable, self).__repr__()
 
-  return KernelDistributedVariable(variable, alter_kernel, upon_kernel_assign)
+        # pylint: disable=missing-format-attribute
+        return ('<KernelDistributedVariable dtype={v.dtype.name} '
+                'inner_variable={v._variable}>'
+               ).format(v=self)
+        # pylint: enable=missing-format-attribute
+
+    return KernelDistributedVariable(variable, self.alter_kernel, self.upon_kernel_assign)
